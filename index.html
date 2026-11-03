@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>도깨비 동작 대전</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+<style>
+  :root{--ink:#1d1a2b;--paper:#f3ead7;--red:#d9382c;--jade:#2fa37a;--gold:#f2b632}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ink);color:var(--paper);font-family:"Noto Sans KR","Malgun Gothic",sans-serif;
+    display:flex;justify-content:center;min-height:100vh}
+  #game{position:relative;width:min(960px,100vw);aspect-ratio:4/3;max-height:100vh;overflow:hidden;background:#000}
+  #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:brightness(.55) saturate(.8)}
+  #cam canvas{width:100%;height:100%;object-fit:cover}
+  #enemyWrap{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);text-align:center;transition:transform .15s}
+  #enemy{font-size:min(30vw,260px);line-height:1;display:block;filter:drop-shadow(0 12px 18px #000a)}
+  #enemy.boss{font-size:min(38vw,330px)}
+  .windup #enemy{animation:shake .12s infinite;filter:drop-shadow(0 0 24px var(--gold))}
+  .attack #enemyWrap{transform:translate(-50%,-50%) scale(1.45)}
+  .hit #enemy{filter:brightness(2.5) drop-shadow(0 0 20px #fff)}
+  @keyframes shake{50%{transform:translateX(8px) rotate(2deg)}}
+  .bar{height:16px;background:#0008;border:2px solid var(--paper);border-radius:3px;overflow:hidden}
+  .bar i{display:block;height:100%;transition:width .25s}
+  #eHud{position:absolute;top:12px;left:50%;transform:translateX(-50%);width:min(60%,420px);text-align:center}
+  #eHud b{font-size:1.1rem}
+  #eHp{background:var(--red)}
+  #pHud{position:absolute;left:14px;bottom:14px;width:min(40%,280px)}
+  #pHp{background:var(--jade)}
+  #state{position:absolute;left:50%;bottom:14%;transform:translateX(-50%);font-size:min(7vw,52px);font-weight:900;
+    text-shadow:0 3px 0 #000,0 0 18px #000;white-space:nowrap}
+  #pose{position:absolute;right:14px;bottom:14px;background:#000a;padding:8px 12px;border-radius:6px;font-size:.95rem;text-align:right}
+  #pose.fist{outline:3px solid var(--red)} #pose.clap{outline:3px solid var(--jade)}
+  #flash{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s}
+  #flash.dmg{background:#d9382c;opacity:.45;transition:none}
+  #overlay{position:absolute;inset:0;background:#1d1a2bf2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px}
+  #overlay h1{margin:0;font-size:min(9vw,56px)}
+  #overlay p{margin:0;max-width:34em;line-height:1.6}
+  button{font:inherit;font-weight:700;padding:12px 32px;border:0;border-radius:6px;background:var(--gold);color:var(--ink);cursor:pointer;font-size:1.1rem}
+  button:disabled{opacity:.5;cursor:wait}
+</style>
+</head>
+<body>
+<div id="game">
+  <div id="cam"></div>
+  <div id="eHud"><b id="eName"></b><div class="bar"><i id="eHp"></i></div><small id="eTxt"></small></div>
+  <div id="enemyWrap"><span id="enemy">👹</span></div>
+  <div id="state"></div>
+  <div id="pHud"><div class="bar"><i id="pHp"></i></div><small id="pTxt"></small></div>
+  <div id="pose">인식 중...</div>
+  <div id="flash"></div>
+  <div id="overlay">
+    <h1 id="oTitle">도깨비 동작 대전</h1>
+    <p id="oText">웹캠 앞에서 몸이 보이게 서세요.<br>✊ 주먹 = 공격 (20) · 👏 박수 = 방어 (적 공격 무효)<br>도깨비가 "공격 준비" 하면 박수로 막고, 틈이 보이면 주먹을 날리세요!<br><small>(테스트용 키보드: F = 주먹, C = 박수)</small></p>
+    <button id="btn">게임 시작</button>
+  </div>
+</div>
+
+<script>
+// ===== 설정 =====
+const MODEL_URL = "./model.json", META_URL = "./metadata.json";
+const PLAYER_MAX_HP = 100, PLAYER_ATK = 20, HEAL_PER_STAGE = 30;
+const STAGES = [
+  {name:"도깨비 1", hp:100, atk:10, icon:"👹"},
+  {name:"도깨비 2", hp:100, atk:10, icon:"👹"},
+  {name:"도깨비 3", hp:100, atk:10, icon:"👹"},
+  {name:"도깨비 4", hp:100, atk:10, icon:"👹"},
+  {name:"보스 도깨비", hp:200, atk:20, icon:"👺", boss:true},
+];
+const T_IDLE = 900, T_WINDUP = 1800, T_ATTACK = 1100; // ms
+const FIST_COOLDOWN = 700, CONF = 0.85;
+const LABEL_FIST = "주먹", LABEL_CLAP = "박수";
+
+// ===== 상태 =====
+let model, webcam, running = false, loopOn = false;
+let stage = 0, eHp, pHp, phase = "idle", phaseStart = 0, blocked = false;
+let action = null, lastAction = null, lastFist = 0, lastClap = 0, busy = false;
+const $ = id => document.getElementById(id);
+const game = $("game");
+
+// ===== 모델 / 웹캠 =====
+async function init() {
+  $("btn").disabled = true; $("btn").textContent = "불러오는 중...";
+  try {
+    model = await tmPose.load(MODEL_URL, META_URL);
+    webcam = new tmPose.Webcam(640, 480, true);
+    await webcam.setup(); await webcam.play();
+    $("cam").appendChild(webcam.canvas);
+  } catch (e) {
+    $("oText").innerHTML = "모델/웹캠을 불러오지 못했어요.<br>① 로컬 서버(예: <code>python -m http.server</code>)로 열었는지<br>② model.json·metadata.json·weights.bin이 같은 폴더에 있는지<br>③ 카메라 권한을 허용했는지 확인하세요.<br><small>"+e.message+"</small>";
+    $("btn").disabled = false; $("btn").textContent = "다시 시도"; return false;
+  }
+  if (!loopOn) { loopOn = true; requestAnimationFrame(loop); }
+  return true;
+}
+
+async function loop() {
+  webcam.update();
+  if (!busy) {
+    busy = true;
+    try {
+      const {pose, posenetOutput} = await model.estimatePose(webcam.canvas);
+      const pred = await model.predict(posenetOutput);
+      const best = pred.reduce((a, b) => a.probability > b.probability ? a : b);
+      action = best.probability >= CONF ? best.className : null;
+      $("pose").textContent = action ? `${action} (${Math.round(best.probability*100)}%)` : "동작 없음";
+      handleAction();
+    } catch (e) { console.error(e); }
+    busy = false;
+  }
+  requestAnimationFrame(loop);
+}
+
+// 모델 인식 + 키보드 테스트 입력 처리
+const keys = {};
+addEventListener("keydown", e => { if (e.key==="f"||e.key==="F") { keys.fist = true; onFist(); } if (e.key==="c"||e.key==="C") { keys.clap = true; onClap(); } });
+function onFist(){ if (!running || phase==="none") return;
+  const now = performance.now(); if (now - lastFist < FIST_COOLDOWN) return;
+  lastFist = now; damageEnemy(PLAYER_ATK); }
+function onClap(){ lastClap = performance.now(); if (phase === "attack") blocked = true; }
+function handleAction() {
+  document.getElementById("pose").className = action===LABEL_FIST?"fist":action===LABEL_CLAP?"clap":"";
+  if (action === LABEL_CLAP) onClap();
+  if (action === LABEL_FIST && lastAction !== LABEL_FIST) onFist(); // 주먹으로 '바뀌는 순간'에만 공격
+  lastAction = action;
+}
+
+// ===== 게임 로직 =====
+function startStage(i) {
+  stage = i; const s = STAGES[i];
+  eHp = s.hp; phase = "idle"; phaseStart = performance.now();
+  $("enemy").textContent = s.icon; $("enemy").className = s.boss ? "boss" : "";
+  $("eName").textContent = `STAGE ${i+1}/5 · ${s.name}`;
+  updateHud(); setState("");
+}
+function updateHud() {
+  const s = STAGES[stage];
+  $("eHp").style.width = Math.max(0, eHp / s.hp * 100) + "%";
+  $("eTxt").textContent = `HP ${Math.max(0,eHp)} / ${s.hp} · 공격력 ${s.atk}`;
+  $("pHp").style.width = Math.max(0, pHp / PLAYER_MAX_HP * 100) + "%";
+  $("pTxt").textContent = `내 HP ${Math.max(0,pHp)} / ${PLAYER_MAX_HP}`;
+}
+function setState(t, color) { const el = $("state"); el.textContent = t; el.style.color = color || "var(--paper)"; }
+function setPhase(p) { phase = p; phaseStart = performance.now(); game.className = p === "windup" ? "windup" : p === "attack" ? "attack" : ""; }
+
+function damageEnemy(d) {
+  eHp -= d; updateHud();
+  game.classList.add("hit"); setTimeout(() => game.classList.remove("hit"), 120);
+  if (eHp <= 0) winStage();
+}
+function winStage() {
+  running = false; setPhase("none"); game.className = "";
+  if (stage === STAGES.length - 1) return endGame(true);
+  setState("쓰러뜨렸다!", "var(--gold)");
+  setTimeout(() => { pHp = Math.min(PLAYER_MAX_HP, pHp + HEAL_PER_STAGE); startStage(stage + 1); running = true; }, 2000);
+}
+function endGame(win) {
+  running = false;
+  $("oTitle").textContent = win ? "🎉 전 스테이지 클리어!" : "💀 패배...";
+  $("oText").textContent = win ? "보스 도깨비까지 쓰러뜨렸어요!" : `STAGE ${stage+1}에서 쓰러졌어요.`;
+  $("btn").textContent = "다시 하기"; $("btn").disabled = false; $("overlay").style.display = "flex";
+}
+
+setInterval(() => {
+  if (!running) return;
+  const t = performance.now() - phaseStart, s = STAGES[stage];
+  if (phase === "idle" && t > T_IDLE) { setPhase("windup"); setState("공격 준비!", "var(--gold)"); }
+  else if (phase === "windup" && t > T_WINDUP) {
+    setPhase("attack"); setState("공격!! 박수로 막아!", "var(--red)");
+    blocked = performance.now() - lastClap < 300 || action === LABEL_CLAP; // 직전 박수도 인정
+  }
+  else if (phase === "attack" && t > T_ATTACK) {
+    if (blocked) { setState("방어 성공! 🛡️", "var(--jade)"); }
+    else {
+      pHp -= s.atk; updateHud(); const f = $("flash"); f.className = "dmg"; setTimeout(() => f.className = "", 60);
+      setState(`-${s.atk} 피격!`, "var(--red)");
+      if (pHp <= 0) return endGame(false);
+    }
+    blocked = false; setPhase("idle");
+    setTimeout(() => { if (phase === "idle") setState(""); }, 700);
+  }
+}, 30);
+
+$("btn").onclick = async () => {
+  if (!model && !(await init())) return;
+  pHp = PLAYER_MAX_HP; $("overlay").style.display = "none"; startStage(0); running = true;
+};
+</script>
+</body>
+</html>
